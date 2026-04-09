@@ -32,16 +32,34 @@ A 14-node Kubernetes cluster built from Rubik Pi 3 single-board computers, house
 ```
 Internet
    |
-pfSense (desktop)  ← NAT gateway / DHCP boundary
+pfSense (desktop)  ← port forwards inbound traffic to nginx
+   |
+nginx reverse proxy (x86 machine)  ← routes /gradescope → autograder service
    |
 MikroTik CRS328 (switch mode)
-   |-- Node 01 (static IP)
-   |-- Node 02 (static IP)
+   |-- Node 01 (192.168.1.2)
+   |-- Node 02 (192.168.1.3)
    ...
-   |-- Node 14 (static IP)
+   |-- Node 14 (192.168.1.15)
 ```
 
-All 14 nodes are on a private subnet behind pfSense. Each node is assigned a **static IP address**. pfSense provides NAT for outbound internet access.
+All 14 nodes are on a private subnet behind pfSense. pfSense provides NAT for outbound internet access and port-forwards inbound traffic to the nginx reverse proxy.
+
+### Reverse Proxy
+
+An nginx instance running on a separate x86 machine handles inbound requests. pfSense is configured to port-forward external traffic to this machine. nginx proxies requests at the `/gradescope` path to the autograder service running in the cluster.
+
+Example nginx location block:
+
+```nginx
+location /gradescope/ {
+    proxy_pass http://<autograder-service-ip>:5000/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+}
+```
+
+This allows Gradescope (or any external client) to reach the autograder at `http://<hostname>/gradescope/submit`, `http://<hostname>/gradescope/status/<id>`, etc.
 
 ---
 
@@ -164,7 +182,107 @@ All 14 nodes should appear with a `Ready` status.
 
 ---
 
+## Autograder Service
+
+Student submissions are run via a Go HTTP service from the [junkyard-autograder](https://github.com/junkyard-computing/junkyard-autograder) project. The service accepts a student's code as a zip archive, creates a Kubernetes Job to run it, and returns the results.
+
+The server listens on port **5000**.
+
+### Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/submit` | Submit a student assignment for grading |
+| `GET` | `/status/<job-id>` | Poll for job status and results |
+| `GET` | `/logs/<job-id>` | Fetch raw logs for a completed job |
+| `GET` | `/` | Health check |
+
+All endpoints require a `Authorization: Bearer <token>` header.
+
+**`POST /submit`** accepts a multipart form with:
+- `image` — assignment name (the last character is parsed as the PA number, e.g. `pa2` → runs `/autograder/source/PA2/cluster/run_autograder`)
+- `script` — a `.zip` archive of the student's submission
+
+The server responds immediately with `202 Accepted` and a `job_id`. The client should poll `/status/<job-id>` until the status is `succeeded` or `failed`.
+
+**`GET /status/<job-id>`** returns a JSON payload:
+
+```json
+{
+  "status": "succeeded",
+  "results": "{ ...grading JSON... }",
+  "score": 0,
+  "latency": "1m23s",
+  "error": ""
+}
+```
+
+Grading results are parsed from the job logs between `---JSON_START---` and `---JSON_END---` markers. If those markers are absent (e.g. the student's code crashed), a fallback zero-score result is returned.
+
+### Environment Variables
+
+| Variable | Required | Description |
+|---|---|---|
+| `RUNNER_IMAGE` | Yes | Docker image used to run student code |
+| `REGISTRY_SECRET_NAME` | Yes | Kubernetes image pull secret name |
+| `GPU_DEVICE_PATH` | Yes | Host path to the GPU device (e.g. `/dev/mali0`) |
+| `AUTOGRADER_TIMEOUT` | No | Job timeout in seconds (default: `120`) |
+| `KUBECONFIG` | No | Path to kubeconfig file; omit to use in-cluster config |
+
+### How Jobs Are Run
+
+For each submission the service:
+
+1. Creates a Kubernetes **ConfigMap** containing the student's zip archive
+2. Creates a Kubernetes **Job** that mounts the ConfigMap and runs the autograder script
+3. Monitors the job in a background goroutine, polling every 2 seconds
+4. Fetches pod logs on completion and parses the grading JSON
+5. Deletes the Job and ConfigMap after completion
+
+Each job pod:
+- Uses **pod anti-affinity** (`work: assignmentExecution` label, `topologyKey: kubernetes.io/hostname`) to enforce one pod per node
+- Mounts the GPU device (`GPU_DEVICE_PATH`), `/dev/dri`, and a HuggingFace model cache from the host
+- Runs as **privileged** with `hostPID: true` for GPU access
+- Never restarts (`RestartPolicy: Never`)
+- Is automatically deleted 120 seconds after completion
+
+The in-memory job store is cleaned up after 1 hour. The service does not persist state across restarts.
+
+> **Configuration note:** The specific deployment configuration (Kubernetes manifests, secret values, registry details) is not currently documented here.
+
+---
+
+## GPU Access
+
+The Rubik Pi 3 includes a Qualcomm Adreno GPU. We used it primarily for **OpenCL** access. To access the GPU from within a container, use the pre-built Docker image maintained here:
+
+> https://github.com/KastnerRG/qualcomm-docker-image
+
+Follow the instructions in that repo to build and run the image on a node. The container provides the necessary drivers and runtime environment for OpenCL workloads on the Rubik Pi.
+
+---
+
 ## Known Issues and Lessons Learned
+
+### One pod per node
+
+When running student workloads, we found it best to schedule **one pod per node**. This gives each student full access to the board's resources (CPU, GPU, memory) without contention from other pods.
+
+Enforce this using pod anti-affinity in the pod spec:
+
+```yaml
+affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels:
+            app: <your-app-label>
+        topologyKey: kubernetes.io/hostname
+```
+
+This tells the scheduler to place no two pods with the same label on the same node.
+
+---
 
 ### Control plane taint
 
