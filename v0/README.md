@@ -221,13 +221,13 @@ Grading results are parsed from the job logs between `---JSON_START---` and `---
 
 ### Environment Variables
 
-| Variable | Required | Description |
+| Variable | Value | Description |
 |---|---|---|
-| `RUNNER_IMAGE` | Yes | Docker image used to run student code |
-| `REGISTRY_SECRET_NAME` | Yes | Kubernetes image pull secret name |
-| `GPU_DEVICE_PATH` | Yes | Host path to the GPU device (e.g. `/dev/mali0`) |
-| `AUTOGRADER_TIMEOUT` | No | Job timeout in seconds (default: `120`) |
-| `KUBECONFIG` | No | Path to kubeconfig file; omit to use in-cluster config |
+| `RUNNER_IMAGE` | `ghcr.io/kastnerrg/cse160-autograder:gpu-adreno` | Docker image used to run student code |
+| `REGISTRY_SECRET_NAME` | `ghcr-login-secret` | Kubernetes image pull secret name |
+| `GPU_DEVICE_PATH` | `/dev/kgsl-3d0` | Host path to the Adreno GPU device |
+| `AUTOGRADER_TIMEOUT` | `1800` | Job timeout in seconds (30 minutes) |
+| `KUBECONFIG` | — | Omitted; service uses in-cluster config |
 
 ### How Jobs Are Run
 
@@ -241,14 +241,120 @@ For each submission the service:
 
 Each job pod:
 - Uses **pod anti-affinity** (`work: assignmentExecution` label, `topologyKey: kubernetes.io/hostname`) to enforce one pod per node
-- Mounts the GPU device (`GPU_DEVICE_PATH`), `/dev/dri`, and a HuggingFace model cache from the host
+- Mounts the GPU device (`/dev/kgsl-3d0`), `/dev/dri`, and a HuggingFace model cache from the host
 - Runs as **privileged** with `hostPID: true` for GPU access
 - Never restarts (`RestartPolicy: Never`)
 - Is automatically deleted 120 seconds after completion
 
 The in-memory job store is cleaned up after 1 hour. The service does not persist state across restarts.
 
-> **Configuration note:** The specific deployment configuration (Kubernetes manifests, secret values, registry details) is not currently documented here.
+### Deployment
+
+The autograder service is deployed as a Kubernetes `Deployment` with an associated `ServiceAccount`, `Role`, and `RoleBinding` granting it permission to manage Jobs, ConfigMaps, Pods, and Pod logs in the `default` namespace. It is exposed via a `NodePort` service on port `30080`.
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: job-server-sa
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: job-server-role
+  namespace: default
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "delete", "get", "list"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list", "get"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: job-server-binding
+  namespace: default
+subjects:
+  - kind: ServiceAccount
+    name: job-server-sa
+    namespace: default
+roleRef:
+  kind: Role
+  name: job-server-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: job-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: job-server
+  template:
+    metadata:
+      labels:
+        app: job-server
+    spec:
+      serviceAccountName: job-server-sa
+      containers:
+        - name: job-server
+          image: ghcr.io/junkyard-computing/junkyard-autograder:latest
+          imagePullPolicy: Always
+          env:
+            - name: RUNNER_IMAGE
+              value: "ghcr.io/kastnerrg/cse160-autograder:gpu-adreno"
+            - name: GPU_DEVICE_PATH
+              value: "/dev/kgsl-3d0"
+            - name: REGISTRY_SECRET_NAME
+              value: "ghcr-login-secret"
+            - name: AUTOGRADER_TIMEOUT
+              value: "1800"
+          ports:
+            - containerPort: 5000
+      imagePullSecrets:
+        - name: ghcr-login-secret
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: job-server-service
+spec:
+  type: NodePort
+  selector:
+    app: job-server
+  ports:
+    - port: 5000
+      targetPort: 5000
+      protocol: TCP
+      nodePort: 30080
+```
+
+Before applying, create the image pull secret for the GitHub Container Registry:
+
+```bash
+microk8s kubectl create secret docker-registry ghcr-login-secret \
+  --docker-server=ghcr.io \
+  --docker-username=<github-username> \
+  --docker-password=<github-pat> \
+  --namespace=default
+```
+
+Apply the manifest:
+
+```bash
+microk8s kubectl apply -f autograder.yaml
+```
 
 ---
 
